@@ -38,8 +38,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--tickers",
         nargs="+",
-        default=config.DEFAULT_TICKERS,
-        help="Ticker symbols (default: %(default)s)",
+        default=None,
+        help=(
+            "One or more tickers (space- or comma-separated). "
+            f"Default: {' '.join(config.DEFAULT_TICKERS)}"
+        ),
     )
     p.add_argument("--lookback", type=int, default=config.LOOKBACK)
     p.add_argument("--epochs", type=int, default=config.EPOCHS)
@@ -59,15 +62,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    tickers = config.parse_tickers(args.tickers)
 
     # Honour CLI period override via config mutation for this process.
     config.DATA_PERIOD = args.period
 
     # Fetch/build data *before* importing TensorFlow — Yahoo crumb / curl_cffi
     # impersonation can flake once TF has initialised native runtimes.
-    logger.info("Building dataset for tickers=%s lookback=%d …", args.tickers, args.lookback)
+    logger.info("Building dataset for tickers=%s lookback=%d …", tickers, args.lookback)
     bundle = build_dataset(
-        tickers=args.tickers,
+        tickers=tickers,
         lookback=args.lookback,
         train_ratio=args.train_ratio,
     )
@@ -115,6 +119,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
     ]
 
+    # shuffle=False keeps Keras validation_split as the trailing slice of the
+    # train arrays (no random mix of early/late windows into val).
     history = model.fit(
         bundle.X_train,
         y_train,
@@ -122,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
         batch_size=args.batch_size,
         validation_split=config.VALIDATION_SPLIT,
         callbacks=callbacks,
-        shuffle=True,
+        shuffle=False,
         verbose=1,
     )
 
@@ -135,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Persist lightweight training metadata for evaluate.py / reproducibility.
     meta = {
-        "tickers": args.tickers,
+        "tickers": tickers,
         "lookback": bundle.lookback,
         "feature_columns": bundle.feature_columns,
         "train_samples": int(len(bundle.X_train)),

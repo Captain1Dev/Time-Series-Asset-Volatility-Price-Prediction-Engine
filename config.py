@@ -21,7 +21,8 @@ SCALER_DIR = ARTIFACTS_DIR / "scalers"
 # ---------------------------------------------------------------------------
 # Data / tickers
 # ---------------------------------------------------------------------------
-# Default universe — a small, liquid set that downloads quickly.
+# Default universe — a small, liquid multi-ticker set that downloads quickly.
+# Always treated as a list end-to-end (train / evaluate / walk-forward).
 DEFAULT_TICKERS: list[str] = ["AAPL", "MSFT", "GOOGL"]
 
 # yfinance history window. Use period OR (start, end); period wins if both set.
@@ -29,6 +30,35 @@ DATA_PERIOD: str = "5y"
 DATA_START: str | None = None
 DATA_END: str | None = None
 DATA_INTERVAL: str = "1d"
+
+
+def parse_tickers(values: list[str] | str | None = None) -> list[str]:
+    """
+    Normalize CLI / config tickers to a de-duplicated uppercase list.
+
+    Accepts ``None`` (→ defaults), a single string (``\"AAPL,MSFT\"`` or
+    ``\"AAPL MSFT\"``), or an argparse ``nargs=\"+\"`` list that may itself
+    contain comma-separated tokens.
+    """
+    if values is None:
+        return list(DEFAULT_TICKERS)
+    if isinstance(values, str):
+        raw = [values]
+    else:
+        raw = list(values)
+    if not raw:
+        return list(DEFAULT_TICKERS)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in raw:
+        # Allow "AAPL,MSFT" or "AAPL;MSFT" alongside space-separated nargs.
+        for part in token.replace(";", ",").split(","):
+            ticker = part.strip().upper()
+            if ticker and ticker not in seen:
+                seen.add(ticker)
+                out.append(ticker)
+    return out or list(DEFAULT_TICKERS)
 
 # ---------------------------------------------------------------------------
 # Feature engineering
@@ -91,3 +121,14 @@ CHECKPOINT_NAME: str = "lstm_dual_head.keras"
 # ---------------------------------------------------------------------------
 MA_BASELINE_WINDOW: int = 20  # moving-average strategy lookback
 ANNUALIZATION_FACTOR: float = 252.0  # trading days for Sharpe proxy
+
+# ---------------------------------------------------------------------------
+# Walk-forward validation (time-ordered; no shuffle across the split)
+# ---------------------------------------------------------------------------
+# Expanding: train = [start .. test_start); Rolling: fixed-length train window
+# ending at test_start. Test folds partition the post-min-train calendar.
+WF_N_SPLITS: int = 4
+WF_MODE: str = "expanding"  # "expanding" | "rolling"
+WF_MIN_TRAIN_FRACTION: float = 0.50  # earliest fold's train ends here (by date count)
+WF_ROLLING_TRAIN_FRACTION: float = 0.50  # rolling mode: train window length / n_dates
+WF_EPOCHS: int = 15  # epochs per fold when evaluate --walk-forward retrains
