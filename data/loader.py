@@ -18,7 +18,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 import numpy as np
 import pandas as pd
@@ -79,7 +79,7 @@ def fetch_ohlcv(
     Returns a MultiIndex (date, ticker) DataFrame with lowercase columns:
     open, high, low, close, volume, adj_close (when available).
     """
-    tickers = list(tickers or config.DEFAULT_TICKERS)
+    tickers = config.parse_tickers(list(tickers) if tickers is not None else None)
     period = period if period is not None else config.DATA_PERIOD
     start = start if start is not None else config.DATA_START
     end = end if end is not None else config.DATA_END
@@ -364,38 +364,34 @@ class DatasetBundle:
     test_index: pd.MultiIndex  # (date, ticker) aligned with test samples
     test_close: np.ndarray  # close prices aligned with test samples (for backtests)
     lookback: int
+    tickers: list[str] | None = None
 
 
-def build_dataset(
-    features: pd.DataFrame | None = None,
-    tickers: Iterable[str] | None = None,
-    lookback: int | None = None,
-    train_ratio: float | None = None,
-    scaler_type: str | None = None,
+@dataclass
+class WalkForwardFold:
+    """One time-ordered walk-forward fold (scaler fit on that fold's train only)."""
+
+    fold_id: int
+    mode: str  # "expanding" | "rolling"
+    train_start: pd.Timestamp
+    train_end: pd.Timestamp
+    test_start: pd.Timestamp
+    test_end: pd.Timestamp
+    bundle: DatasetBundle
+
+
+def _bundle_from_frames(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_columns: list[str],
+    scaler_type: str,
+    lookback: int,
+    tickers: list[str] | None = None,
 ) -> DatasetBundle:
-    """
-    End-to-end: fetch → features → chronological split → fit scaler on train
-    → sliding windows for train and test.
-    """
-    lookback = lookback or config.LOOKBACK
-    train_ratio = train_ratio if train_ratio is not None else config.TRAIN_RATIO
-    scaler_type = scaler_type or config.SCALER_TYPE
-    feature_columns = list(config.FEATURE_COLUMNS)
-
-    if features is None:
-        ohlcv = fetch_ohlcv(tickers=tickers)
-        features = prepare_features(ohlcv)
-
-    # Chronological split on the global date axis (shared calendar).
-    dates = features.index.get_level_values("date").unique().sort_values()
-    split_idx = max(int(len(dates) * train_ratio), 1)
-    split_date = dates[split_idx - 1]
-    train_df = features.loc[features.index.get_level_values("date") <= split_date]
-    test_df = features.loc[features.index.get_level_values("date") > split_date]
-
+    """Fit scaler on train_df only, then window train and test (no shuffle)."""
     if train_df.empty or test_df.empty:
         raise RuntimeError(
-            "Train or test split is empty — widen the history window or lower train_ratio."
+            "Train or test split is empty — widen the history window or adjust fold sizes."
         )
 
     scaler = _make_scaler(scaler_type)
@@ -414,13 +410,12 @@ def build_dataset(
             "Reduce LOOKBACK or download a longer history."
         )
 
-    logger.info(
-        "Dataset ready — train windows: %d, test windows: %d, features: %d, lookback: %d",
-        len(X_train),
-        len(X_test),
-        len(feature_columns),
-        lookback,
-    )
+    if tickers is None:
+        tickers = sorted(
+            set(train_df.index.get_level_values("ticker")).union(
+                test_df.index.get_level_values("ticker")
+            )
+        )
 
     return DatasetBundle(
         X_train=X_train,
@@ -434,7 +429,187 @@ def build_dataset(
         test_index=test_index,
         test_close=test_close,
         lookback=lookback,
+        tickers=list(tickers),
     )
+
+
+def build_dataset(
+    features: pd.DataFrame | None = None,
+    tickers: Iterable[str] | None = None,
+    lookback: int | None = None,
+    train_ratio: float | None = None,
+    scaler_type: str | None = None,
+) -> DatasetBundle:
+    """
+    End-to-end: fetch → features → chronological split → fit scaler on train
+    → sliding windows for train and test.
+    """
+    lookback = lookback or config.LOOKBACK
+    train_ratio = train_ratio if train_ratio is not None else config.TRAIN_RATIO
+    scaler_type = scaler_type or config.SCALER_TYPE
+    feature_columns = list(config.FEATURE_COLUMNS)
+    tickers_list = config.parse_tickers(list(tickers) if tickers is not None else None)
+
+    if features is None:
+        ohlcv = fetch_ohlcv(tickers=tickers_list)
+        features = prepare_features(ohlcv)
+
+    # Chronological split on the global date axis (shared calendar across tickers).
+    dates = features.index.get_level_values("date").unique().sort_values()
+    split_idx = max(int(len(dates) * train_ratio), 1)
+    split_date = dates[split_idx - 1]
+    train_df = features.loc[features.index.get_level_values("date") <= split_date]
+    test_df = features.loc[features.index.get_level_values("date") > split_date]
+
+    bundle = _bundle_from_frames(
+        train_df,
+        test_df,
+        feature_columns=feature_columns,
+        scaler_type=scaler_type,
+        lookback=lookback,
+        tickers=tickers_list,
+    )
+    logger.info(
+        "Dataset ready — tickers=%s train windows: %d, test windows: %d, features: %d, lookback: %d",
+        bundle.tickers,
+        len(bundle.X_train),
+        len(bundle.X_test),
+        len(feature_columns),
+        lookback,
+    )
+    return bundle
+
+
+def iter_walk_forward_folds(
+    features: pd.DataFrame | None = None,
+    tickers: Iterable[str] | None = None,
+    n_splits: int | None = None,
+    mode: str | None = None,
+    lookback: int | None = None,
+    min_train_fraction: float | None = None,
+    rolling_train_fraction: float | None = None,
+    scaler_type: str | None = None,
+) -> Iterator[WalkForwardFold]:
+    """
+    Yield time-ordered walk-forward folds (expanding or rolling).
+
+    Fold logic (shared calendar across all tickers)
+    ----------------------------------------------
+    1. Sort unique trading dates; never shuffle.
+    2. The earliest ``min_train_fraction`` of dates is the minimum training
+       history. Remaining dates are partitioned into ``n_splits`` contiguous
+       test blocks (as equal as integer division allows).
+    3. **Expanding**: fold *k* trains on all dates before its test block
+       (history grows). **Rolling**: train length is
+       ``rolling_train_fraction * n_dates``, ending immediately before the
+       test block (fixed-length window slides forward).
+    4. Feature scaler is fit on that fold's train rows only; sliding windows
+       are built per ticker so sequences never cross assets.
+    """
+    n_splits = n_splits if n_splits is not None else config.WF_N_SPLITS
+    mode = (mode or config.WF_MODE).lower()
+    if mode not in {"expanding", "rolling"}:
+        raise ValueError(f"Unknown walk-forward mode={mode!r}; use 'expanding' or 'rolling'.")
+    lookback = lookback or config.LOOKBACK
+    min_train_fraction = (
+        min_train_fraction
+        if min_train_fraction is not None
+        else config.WF_MIN_TRAIN_FRACTION
+    )
+    rolling_train_fraction = (
+        rolling_train_fraction
+        if rolling_train_fraction is not None
+        else config.WF_ROLLING_TRAIN_FRACTION
+    )
+    scaler_type = scaler_type or config.SCALER_TYPE
+    feature_columns = list(config.FEATURE_COLUMNS)
+    tickers_list = config.parse_tickers(list(tickers) if tickers is not None else None)
+
+    if features is None:
+        ohlcv = fetch_ohlcv(tickers=tickers_list)
+        features = prepare_features(ohlcv)
+
+    dates = features.index.get_level_values("date").unique().sort_values()
+    n_dates = len(dates)
+    min_train = max(int(n_dates * min_train_fraction), lookback + 5)
+    remain = n_dates - min_train
+    if n_splits < 1:
+        raise ValueError("n_splits must be >= 1")
+    if remain < n_splits:
+        raise RuntimeError(
+            f"Need at least {n_splits} post-train dates for walk-forward; "
+            f"have {remain} after min_train={min_train} of {n_dates}. "
+            "Lower --wf-splits, raise --period, or lower WF_MIN_TRAIN_FRACTION."
+        )
+
+    # Partition remaining calendar into n_splits contiguous test blocks.
+    base, extra = divmod(remain, n_splits)
+    test_sizes = [base + (1 if i < extra else 0) for i in range(n_splits)]
+    rolling_train_len = max(int(n_dates * rolling_train_fraction), lookback + 5)
+
+    offset = min_train
+    for fold_id, test_size in enumerate(test_sizes):
+        test_start_idx = offset
+        test_end_idx = offset + test_size  # exclusive
+        offset = test_end_idx
+
+        if mode == "expanding":
+            train_start_idx = 0
+            train_end_idx = test_start_idx
+        else:
+            train_end_idx = test_start_idx
+            train_start_idx = max(0, train_end_idx - rolling_train_len)
+
+        train_dates = dates[train_start_idx:train_end_idx]
+        test_dates = dates[test_start_idx:test_end_idx]
+        if len(train_dates) == 0 or len(test_dates) == 0:
+            logger.warning("Skipping empty fold %d", fold_id)
+            continue
+
+        date_level = features.index.get_level_values("date")
+        train_df = features.loc[
+            (date_level >= train_dates[0]) & (date_level <= train_dates[-1])
+        ]
+        test_df = features.loc[
+            (date_level >= test_dates[0]) & (date_level <= test_dates[-1])
+        ]
+
+        try:
+            bundle = _bundle_from_frames(
+                train_df,
+                test_df,
+                feature_columns=feature_columns,
+                scaler_type=scaler_type,
+                lookback=lookback,
+                tickers=tickers_list,
+            )
+        except RuntimeError as exc:
+            logger.warning("Skipping fold %d (%s)", fold_id, exc)
+            continue
+
+        logger.info(
+            "Walk-forward fold %d/%d mode=%s train=[%s .. %s] test=[%s .. %s] "
+            "train_n=%d test_n=%d tickers=%s",
+            fold_id + 1,
+            n_splits,
+            mode,
+            train_dates[0].date(),
+            train_dates[-1].date(),
+            test_dates[0].date(),
+            test_dates[-1].date(),
+            len(bundle.X_train),
+            len(bundle.X_test),
+            tickers_list,
+        )
+        yield WalkForwardFold(
+            fold_id=fold_id,
+            mode=mode,
+            train_start=pd.Timestamp(train_dates[0]),
+            train_end=pd.Timestamp(train_dates[-1]),
+            test_start=pd.Timestamp(test_dates[0]),
+            test_end=pd.Timestamp(test_dates[-1]),
+            bundle=bundle,
+        )
 
 
 def _window_ticker_frames(
